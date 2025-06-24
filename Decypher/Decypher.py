@@ -536,12 +536,12 @@ def create_causal_matrix(G, output_dir):
     plt.show()
     print(f"Causal matrix saved to {os.path.join(output_dir, 'causal_matrix_mediation.png')}")
 
-def PhysioNexus(data, exclude_cols=2, corr_threshold=0.6, f_stat_threshold=10, 
+def Decypher(data, exclude_cols=2, corr_threshold=0.6, f_stat_threshold=10, 
                 p_value_threshold=0.05, max_lag=2, output_dir=None, 
                 multivariate_groups=None, enable_mediation_analysis=True,
                 mediation_threshold=0.6):
     """
-    Enhanced PhysioNexus function with mediation analysis for causal pathway discovery
+    Enhanced Decypher function with mediation analysis for causal pathway discovery
     
     Parameters:
     - data: DataFrame with time series data
