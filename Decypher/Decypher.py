@@ -4,81 +4,62 @@ import networkx as nx
 import matplotlib.pyplot as plt
 import seaborn as sns
 from statsmodels.tsa.stattools import grangercausalitytests
+from statsmodels.tsa.arima.model import ARIMA
 import statsmodels.api as sm
 import os
 import scipy.stats
-import plotly.graph_objects as go
 from itertools import combinations
 import warnings
 warnings.filterwarnings('ignore')
 
-def check_multivariate_granger_causality(data, target, predictors, max_lag=2, f_stat_threshold=10, p_value_threshold=0.05):
+def detect_time_columns(data):
     """
-    Test if multiple variables jointly Granger-cause a target variable.
-    
-    Parameters:
-    - data: DataFrame containing all variables
-    - target: Target variable name
-    - predictors: List of predictor variable names
-    - max_lag: Maximum lag to test
-    
-    Returns:
-    - is_causal: Boolean indicating if predictors cause target
-    - f_stat: F-statistic
-    - p_value: p-value
-    - lag: Optimal lag
+    Automatically detect time/date columns based on common naming patterns
     """
-    best_f = 0
-    best_p = 1
-    best_lag = 0
-    is_causal = False
+    time_keywords = ['time', 'Time', 'TIME', 'date', 'Date', 'DATE', 
+                     'timestamp', 'Timestamp', 'TIMESTAMP',
+                     'time[s]', 'Time[s]', 'TIME[S]']
     
-    try:
-        # Test each lag from 1 to max_lag
-        for lag in range(1, max_lag + 1):
-            # Create lagged predictors
-            X = pd.DataFrame()
-            y = data[target][lag:]
-            
-            # Add lagged values for each predictor
-            for pred in predictors:
-                for l in range(1, lag + 1):
-                    X[f"{pred}_lag{l}"] = data[pred].shift(l)[lag:]
-            
-            # Also include lagged values of the target variable
-            for l in range(1, lag + 1):
-                X[f"{target}_lag{l}"] = data[target].shift(l)[lag:]
-            
-            # Remove any NaN rows
-            X = X.dropna()
-            y = y[:len(X)]
-            
-            # Create two models: one with and one without the predictor variables
-            restricted_cols = [col for col in X.columns if col.startswith(f"{target}_lag")]
-            if len(restricted_cols) > 0:  # Only proceed if there are target lags
-                model_restricted = sm.OLS(y, X[restricted_cols]).fit()
-                model_unrestricted = sm.OLS(y, X).fit()
-                
-                # F-test for nested models
-                df1 = model_restricted.df_resid - model_unrestricted.df_resid
-                df2 = model_unrestricted.df_resid
-                
-                if df1 > 0 and df2 > 0:  # Only calculate if valid degrees of freedom
-                    f_stat = ((model_restricted.ssr - model_unrestricted.ssr) / df1) / \
-                            (model_unrestricted.ssr / df2)
-                    
-                    p_value = 1 - scipy.stats.f.cdf(f_stat, df1, df2)
-                    
-                    if f_stat > best_f:
-                        best_f = f_stat
-                        best_p = p_value
-                        best_lag = lag
-        
-        is_causal = (best_f > f_stat_threshold) and (best_p < p_value_threshold)
-        return is_causal, best_f, best_p, best_lag
-    except Exception as e:
-        print(f"Error in multivariate testing: {e}")
-        return False, 0, 1, 0
+    time_columns = []
+    for col in data.columns:
+        # Check exact matches
+        if col in time_keywords:
+            time_columns.append(col)
+        # Check if column contains time keywords
+        elif any(keyword.lower() in col.lower() for keyword in ['time', 'date', 'timestamp']):
+            time_columns.append(col)
+        # Check if column is datetime type
+        elif pd.api.types.is_datetime64_any_dtype(data[col]):
+            time_columns.append(col)
+    
+    return time_columns
+
+def clean_data(data):
+    """
+    Basic data cleaning: drop NA rows and remove time columns
+    """
+    print("Performing data cleaning...")
+    
+    # Detect and remove time columns
+    time_columns = detect_time_columns(data)
+    if time_columns:
+        print(f"Detected time columns: {', '.join(time_columns)}")
+        data_cleaned = data.drop(columns=time_columns)
+    else:
+        data_cleaned = data.copy()
+        time_columns = []
+    
+    # Drop rows with any NA values
+    initial_rows = len(data_cleaned)
+    data_cleaned = data_cleaned.dropna()
+    rows_dropped = initial_rows - len(data_cleaned)
+    
+    if rows_dropped > 0:
+        print(f"Dropped {rows_dropped} rows containing NA values")
+    
+    print(f"Final dataset: {len(data_cleaned)} rows, {len(data_cleaned.columns)} columns")
+    
+    return data_cleaned, time_columns
 
 def check_granger_causality(x, y, max_lag=2, f_stat_threshold=10, p_value_threshold=0.05):
     """
@@ -117,525 +98,192 @@ def check_granger_causality(x, y, max_lag=2, f_stat_threshold=10, p_value_thresh
         # Return False if there's an error (e.g., non-stationary data)
         return False, 0, 1, 0
 
-def create_lagged_features(variables, data, max_lag):
+def visualize_network(G, output_dir):
     """
-    Create lagged features for multiple variables.
-    
-    Parameters:
-    - variables: List of variable names
-    - data: DataFrame containing the variables
-    - max_lag: Maximum lag to create
-    
-    Returns:
-    - X: DataFrame with lagged features
+    Create a structured network visualization with eigenvector centrality coloring
     """
-    X = pd.DataFrame()
+    plt.figure(figsize=(16, 12))
     
-    for var in variables:
-        for lag in range(1, max_lag + 1):
-            X[f"{var}_lag{lag}"] = data[var].shift(lag)
-    
-    # Remove NaN rows
-    X = X.dropna()
-    return X
-
-def test_mediation(data, cause, effect, mediator, max_lag=2, p_threshold=0.05):
-    """
-    Test if the relationship between cause and effect is mediated by mediator.
-    
-    Parameters:
-    - data: DataFrame containing all variables
-    - cause: Name of the causal variable
-    - effect: Name of the effect variable
-    - mediator: Name of the potential mediator
-    - max_lag: Maximum lag to test
-    - p_threshold: P-value threshold for significance
-    
-    Returns:
-    - is_mediated: Boolean indicating if relationship is significantly mediated
-    - mediation_ratio: Proportion of effect that is mediated (0-1)
-    - direct_effect_p: P-value for direct effect after controlling for mediator
-    - indirect_effect_strength: Strength of indirect pathway
-    """
+    # Calculate eigenvector centrality for coloring
     try:
-        # Step 1: Check if cause→mediator and mediator→effect pathways exist
-        cause_to_med_causal, _, _, _ = check_granger_causality(
-            data[cause], data[mediator], max_lag=max_lag)
-        med_to_effect_causal, _, _, _ = check_granger_causality(
-            data[mediator], data[effect], max_lag=max_lag)
-        
-        if not (cause_to_med_causal and med_to_effect_causal):
-            return False, 0.0, 1.0, 0.0
-        
-        # Step 2: Test direct effect controlling for mediator
-        # Create lagged variables
-        X_full = create_lagged_features([cause, mediator], data, max_lag)
-        X_mediator_only = create_lagged_features([mediator], data, max_lag)
-        
-        # Align the target variable
-        min_length = min(len(X_full), len(X_mediator_only))
-        y = data[effect][max_lag:max_lag + min_length]
-        X_full = X_full[:min_length]
-        X_mediator_only = X_mediator_only[:min_length]
-        
-        if len(y) < 10:  # Need minimum data points
-            return False, 0.0, 1.0, 0.0
-        
-        # Fit models
-        model_mediator_only = sm.OLS(y, X_mediator_only).fit()
-        model_full = sm.OLS(y, X_full).fit()
-        
-        # F-test for adding cause variables to mediator-only model
-        df1 = model_mediator_only.df_resid - model_full.df_resid
-        df2 = model_full.df_resid
-        
-        if df1 > 0 and df2 > 0:
-            f_stat_direct = ((model_mediator_only.ssr - model_full.ssr) / df1) / \
-                           (model_full.ssr / df2)
-            direct_effect_p = 1 - scipy.stats.f.cdf(f_stat_direct, df1, df2)
-        else:
-            direct_effect_p = 1.0
-        
-        # Step 3: Compare total effect vs direct effect
-        # Total effect: cause→effect without mediator
-        X_cause_only = create_lagged_features([cause], data, max_lag)
-        X_cause_only = X_cause_only[:min_length]
-        
-        model_total = sm.OLS(y, X_cause_only).fit()
-        
-        # Calculate effect sizes (R-squared differences)
-        total_effect_r2 = model_total.rsquared
-        direct_effect_r2 = max(0, model_full.rsquared - model_mediator_only.rsquared)
-        
-        # Mediation ratio: how much of total effect is mediated
-        if total_effect_r2 > 0:
-            mediation_ratio = max(0, (total_effect_r2 - direct_effect_r2) / total_effect_r2)
-        else:
-            mediation_ratio = 0.0
-        
-        # Indirect effect strength (approximation)
-        indirect_effect_strength = total_effect_r2 - direct_effect_r2
-        
-        # Consider mediated if mediation ratio is substantial (not removing edges)
-        is_mediated = mediation_ratio > 0.3  # Lowered threshold since we're not removing
-        
-        return is_mediated, mediation_ratio, direct_effect_p, indirect_effect_strength
-        
-    except Exception as e:
-        print(f"Error in mediation testing for {cause}→{effect} via {mediator}: {e}")
-        return False, 0.0, 1.0, 0.0
-
-def analyze_mediation_relationships(G, data, max_lag=2):
-    """
-    Analyze mediation relationships and classify edges by mediation type.
-    DOES NOT REMOVE EDGES - only classifies them.
+        eigenvector_centrality = nx.eigenvector_centrality(G, max_iter=1000)
+    except:
+        # Fallback to degree centrality if eigenvector fails
+        eigenvector_centrality = nx.degree_centrality(G)
     
-    Parameters:
-    - G: NetworkX DiGraph
-    - data: Original DataFrame
-    - max_lag: Maximum lag for mediation testing
+    # Create structured layout with more spacing
+    pos = nx.spring_layout(G, k=3.0, iterations=500, seed=42)
     
-    Returns:
-    - G_classified: NetworkX DiGraph with edge classifications
-    - mediation_results: List of mediation analysis results
-    """
-    mediation_results = []
+    # Prepare node colors based on eigenvector centrality
+    node_colors = [eigenvector_centrality[node] for node in G.nodes()]
     
-    print("Analyzing mediation relationships...")
+    # Node sizes based on total degree (in + out)
+    node_sizes = [300 + 1000 * G.degree(node) / max([G.degree(n) for n in G.nodes()]) 
+                  for node in G.nodes()]
     
-    # Get all linear causal edges (exclude multivariate group edges)
-    linear_edges = [(u, v) for u, v in G.edges() 
-                   if G.nodes[u].get('node_type') != 'group']
+    # Draw nodes with eigenvector centrality coloring
+    nodes = nx.draw_networkx_nodes(G, pos, 
+                                  node_size=node_sizes, 
+                                  node_color=node_colors,
+                                  cmap=plt.cm.viridis,
+                                  alpha=0.8)
     
-    for cause, effect in linear_edges:
-        # Find potential mediators: nodes that have cause→mediator and mediator→effect edges
-        potential_mediators = []
-        
-        for node in G.nodes():
-            if (node != cause and node != effect and 
-                G.nodes[node].get('node_type') != 'group' and
-                G.has_edge(cause, node) and G.has_edge(node, effect)):
-                potential_mediators.append(node)
-        
-        # Test mediation for each potential mediator
-        best_mediator = None
-        best_mediation_ratio = 0
-        best_mediation_result = None
-        
-        for mediator in potential_mediators:
-            is_mediated, mediation_ratio, direct_p, indirect_strength = test_mediation(
-                data, cause, effect, mediator, max_lag=max_lag)
-            
-            result = {
-                'cause': cause,
-                'effect': effect,
-                'mediator': mediator,
-                'is_mediated': is_mediated,
-                'mediation_ratio': mediation_ratio,
-                'direct_effect_p': direct_p,
-                'indirect_effect_strength': indirect_strength
-            }
-            mediation_results.append(result)
-            
-            if mediation_ratio > best_mediation_ratio:
-                best_mediation_ratio = mediation_ratio
-                best_mediator = mediator
-                best_mediation_result = result
-        
-        # Classify the edge based on mediation analysis
-        if best_mediator is not None and best_mediation_ratio > 0:
-            # Classify edge by mediation strength
-            if best_mediation_ratio < 0.3:
-                edge_type = 'direct'
-                line_style = 'solid'
-                line_width = 3
-            elif best_mediation_ratio < 0.7:
-                edge_type = 'partially_mediated'
-                line_style = 'dashed'
-                line_width = 2
-            else:
-                edge_type = 'fully_mediated'
-                line_style = 'dotted'
-                line_width = 1
-            
-            # Update edge attributes
-            G[cause][effect].update({
-                'mediation_type': edge_type,
-                'line_style': line_style,
-                'line_width': line_width,
-                'mediation_ratio': best_mediation_ratio,
-                'best_mediator': best_mediator,
-                'mediation_tested': True
-            })
-            
-            print(f"Classified {cause} → {effect}: {edge_type} (ratio: {best_mediation_ratio:.3f}, mediator: {best_mediator})")
-        else:
-            # No mediation found - mark as direct
-            G[cause][effect].update({
-                'mediation_type': 'direct',
-                'line_style': 'solid',
-                'line_width': 3,
-                'mediation_ratio': 0.0,
-                'best_mediator': None,
-                'mediation_tested': True
-            })
+    # Separate edges by correlation type
+    positive_edges = [(u, v) for u, v, d in G.edges(data=True) if d.get('correlation', 0) > 0]
+    negative_edges = [(u, v) for u, v, d in G.edges(data=True) if d.get('correlation', 0) < 0]
     
-    print(f"Analyzed {len(linear_edges)} edges for mediation")
-    
-    return G, mediation_results
-
-def visualize_enhanced_network(G, output_dir, mediation_results=None):
-    """
-    Enhanced network visualization with different line styles for mediation types
-    """
-    plt.figure(figsize=(20, 18))
-    
-    # Define node colors based on type
-    node_colors = []
-    node_sizes = []
-    
-    for node in G.nodes():
-        if G.nodes[node].get('node_type') == 'group':
-            node_colors.append('lightgreen')  # Group nodes
-            node_sizes.append(800)  # Larger for groups
-        else:
-            node_colors.append('lightblue')  # Regular variables
-            node_sizes.append(400 * (1 + G.out_degree(node)))
-    
-    # Separate edges by mediation type
-    direct_edges = []
-    partially_mediated_edges = []
-    fully_mediated_edges = []
-    multivar_edges = []
-    
-    for u, v, data in G.edges(data=True):
-        if G.nodes[u].get('node_type') == 'group':
-            multivar_edges.append((u, v))
-        else:
-            mediation_type = data.get('mediation_type', 'direct')
-            if mediation_type == 'direct':
-                direct_edges.append((u, v))
-            elif mediation_type == 'partially_mediated':
-                partially_mediated_edges.append((u, v))
-            elif mediation_type == 'fully_mediated':
-                fully_mediated_edges.append((u, v))
-            else:
-                direct_edges.append((u, v))  # Default to direct
-    
-    # Create layout with more spacing
-    pos = nx.spring_layout(G, k=1.0, iterations=150, seed=42)
-    
-    # Draw nodes
-    nx.draw_networkx_nodes(G, pos, node_size=node_sizes, node_color=node_colors, alpha=0.8)
-    
-    # Draw different types of edges with different styles
-    if direct_edges:
-        direct_colors = [G[u][v]['color'] for u, v in direct_edges]
-        nx.draw_networkx_edges(G, pos, edgelist=direct_edges, width=3, 
-                              edge_color=direct_colors, style='solid', 
-                              alpha=0.9, arrows=True, arrowstyle='->', arrowsize=15,
+    # Draw positive edges in blue
+    if positive_edges:
+        nx.draw_networkx_edges(G, pos, edgelist=positive_edges, 
+                              edge_color='blue', width=2, alpha=0.7,
+                              arrows=True, arrowstyle='->', arrowsize=20,
                               connectionstyle='arc3,rad=0.1')
     
-    if partially_mediated_edges:
-        partial_colors = [G[u][v]['color'] for u, v in partially_mediated_edges]
-        nx.draw_networkx_edges(G, pos, edgelist=partially_mediated_edges, width=2,
-                              edge_color=partial_colors, style='dashed',
-                              alpha=0.7, arrows=True, arrowstyle='->', arrowsize=12,
+    # Draw negative edges in red
+    if negative_edges:
+        nx.draw_networkx_edges(G, pos, edgelist=negative_edges,
+                              edge_color='red', width=2, alpha=0.7,
+                              arrows=True, arrowstyle='->', arrowsize=20,
                               connectionstyle='arc3,rad=0.1')
     
-    if fully_mediated_edges:
-        fully_colors = [G[u][v]['color'] for u, v in fully_mediated_edges]
-        nx.draw_networkx_edges(G, pos, edgelist=fully_mediated_edges, width=1,
-                              edge_color=fully_colors, style='dotted',
-                              alpha=0.5, arrows=True, arrowstyle='->', arrowsize=10,
-                              connectionstyle='arc3,rad=0.1')
+    # Draw labels
+    nx.draw_networkx_labels(G, pos, font_size=10, font_family='sans-serif', font_weight='bold')
     
-    if multivar_edges:
-        nx.draw_networkx_edges(G, pos, edgelist=multivar_edges, width=4,
-                              edge_color='purple', style='dashdot',
-                              alpha=0.8, arrows=True, arrowstyle='->', arrowsize=18,
-                              connectionstyle='arc3,rad=0.1')
+    # Add colorbar for eigenvector centrality
+    if nodes:
+        plt.colorbar(nodes, label='Eigenvector Centrality', shrink=0.8)
     
-    # Draw labels with better positioning
-    nx.draw_networkx_labels(G, pos, font_size=11, font_family='sans-serif', font_weight='bold')
-    
-    # Create a comprehensive legend
+    # Create legend
     from matplotlib.lines import Line2D
-    legend_elements = []
+    legend_elements = [
+        Line2D([0], [0], color='blue', lw=2, label='Positive Causal Effect'),
+        Line2D([0], [0], color='red', lw=2, label='Negative Causal Effect')
+    ]
+    plt.legend(handles=legend_elements, loc='upper right', fontsize=12)
     
-    # Add legend elements based on what edges exist
-    if direct_edges:
-        legend_elements.extend([
-            Line2D([0], [0], color='blue', lw=3, label='Direct Positive Effect', linestyle='solid'),
-            Line2D([0], [0], color='red', lw=3, label='Direct Negative Effect', linestyle='solid')
-        ])
-    
-    if partially_mediated_edges:
-        legend_elements.extend([
-            Line2D([0], [0], color='blue', linestyle='dashed', lw=2, label='Partially Mediated Positive'),
-            Line2D([0], [0], color='red', linestyle='dashed', lw=2, label='Partially Mediated Negative')
-        ])
-    
-    if fully_mediated_edges:
-        legend_elements.extend([
-            Line2D([0], [0], color='blue', linestyle='dotted', lw=1, label='Fully Mediated Positive'),
-            Line2D([0], [0], color='red', linestyle='dotted', lw=1, label='Fully Mediated Negative')
-        ])
-    
-    if multivar_edges:
-        legend_elements.append(
-            Line2D([0], [0], color='purple', linestyle='dashdot', lw=4, label='Multivariate Causality')
-        )
-    
-    if legend_elements:
-        plt.legend(handles=legend_elements, loc='upper right', fontsize=12, 
-                  title='Relationship Types', title_fontsize=14)
-    
-    plt.title('Causal Network with Mediation Classification\n'
-              'Solid = Direct Effects | Dashed = Partially Mediated | Dotted = Fully Mediated', 
+    plt.title('Causal Network\n(Node color = Eigenvector Centrality, Node size = Total Degree)', 
               fontsize=16, fontweight='bold')
     plt.axis('off')
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'causal_network_mediation_classified.png'), dpi=300, bbox_inches='tight')
-    
-    # Display the plot
+    plt.savefig(os.path.join(output_dir, 'causal_network.png'), dpi=300, bbox_inches='tight')
     plt.show()
-    print(f"Enhanced network visualization saved to {os.path.join(output_dir, 'causal_network_mediation_classified.png')}")
+    print(f"Network visualization saved to {os.path.join(output_dir, 'causal_network.png')}")
 
-def create_mediation_summary(mediation_results, output_dir):
+def create_centrality_csv(G, output_dir):
     """
-    Create a summary visualization of mediation analysis results.
-    """
-    if not mediation_results:
-        return
-    
-    # Convert to DataFrame
-    mediation_df = pd.DataFrame(mediation_results)
-    
-    # Filter for relationships with some mediation
-    significant_mediations = mediation_df[mediation_df['mediation_ratio'] > 0.1]
-    
-    if len(significant_mediations) > 0:
-        # Create mediation strength plot
-        plt.figure(figsize=(14, 10))
-        
-        # Create labels for the plot
-        labels = [f"{row['cause']} → {row['effect']}\n(via {row['mediator']})" 
-                 for _, row in significant_mediations.iterrows()]
-        
-        y_pos = np.arange(len(labels))
-        mediation_ratios = significant_mediations['mediation_ratio'].values
-        
-        # Create horizontal bar plot with colors based on mediation strength
-        colors = ['red' if ratio > 0.7 else 'orange' if ratio > 0.3 else 'lightblue' 
-                 for ratio in mediation_ratios]
-        
-        plt.barh(y_pos, mediation_ratios, color=colors, alpha=0.7)
-        plt.yticks(y_pos, labels)
-        plt.xlabel('Mediation Ratio')
-        plt.title('Mediation Analysis Results\n(All relationships with >10% mediation)')
-        plt.axvline(x=0.3, color='orange', linestyle='--', alpha=0.7, label='30% Mediation (Partial)')
-        plt.axvline(x=0.7, color='red', linestyle='--', alpha=0.7, label='70% Mediation (Full)')
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'mediation_summary_classified.png'), dpi=300, bbox_inches='tight')
-        plt.show()
-        
-        print(f"Mediation summary saved to {os.path.join(output_dir, 'mediation_summary_classified.png')}")
-        
-        # Print summary table
-        print("\nMediation Analysis Results:")
-        summary_table = significant_mediations[['cause', 'effect', 'mediator', 'mediation_ratio', 'direct_effect_p']].copy()
-        summary_table['mediation_ratio'] = summary_table['mediation_ratio'].round(3)
-        summary_table['direct_effect_p'] = summary_table['direct_effect_p'].round(4)
-        summary_table['mediation_type'] = summary_table['mediation_ratio'].apply(
-            lambda x: 'Fully Mediated' if x > 0.7 else 'Partially Mediated' if x > 0.3 else 'Direct'
-        )
-        print(summary_table.to_string(index=False))
-
-def create_alluvial_diagram(G, output_dir):
-    """
-    Create an alluvial (Sankey) diagram showing causal flows with mediation info
+    Create CSV with centrality measures for each node
     """
     if G.number_of_nodes() == 0:
-        print("No nodes in graph. Skipping alluvial diagram.")
-        return
-        
-    # Create source, target, and value lists for Sankey diagram
-    source = []
-    target = []
-    value = []
-    label = []
-    link_colors = []
+        print("No nodes in graph. Skipping centrality CSV.")
+        return None
     
-    # Get unique nodes and assign indices
-    all_nodes = list(G.nodes())
-    node_dict = {node: i for i, node in enumerate(all_nodes)}
+    # Calculate centrality measures
+    out_degree = dict(G.out_degree())
+    in_degree = dict(G.in_degree())
     
-    # Create node labels
-    label = all_nodes
+    try:
+        betweenness_centrality = nx.betweenness_centrality(G)
+    except:
+        betweenness_centrality = {node: 0 for node in G.nodes()}
     
-    # Create links with colors based on mediation type
-    for u, v, data in G.edges(data=True):
-        source.append(node_dict[u])
-        target.append(node_dict[v])
-        
-        # Use F-statistic as value for line thickness
-        if 'f_stat' in data:
-            value.append(data['f_stat'])
-        else:
-            value.append(abs(data.get('correlation', 0.5)) * 10)  # Default fallback
-        
-        # Color based on mediation type
-        mediation_type = data.get('mediation_type', 'direct')
-        if mediation_type == 'direct':
-            link_colors.append('rgba(0, 100, 200, 0.8)')  # Blue
-        elif mediation_type == 'partially_mediated':
-            link_colors.append('rgba(255, 165, 0, 0.6)')  # Orange
-        elif mediation_type == 'fully_mediated':
-            link_colors.append('rgba(200, 200, 200, 0.4)')  # Light gray
-        else:
-            link_colors.append('rgba(128, 0, 128, 0.7)')  # Purple for multivariate
+    try:
+        eigenvector_centrality = nx.eigenvector_centrality(G, max_iter=1000)
+    except:
+        # Fallback to degree centrality if eigenvector fails
+        eigenvector_centrality = nx.degree_centrality(G)
     
-    # Create figure
-    fig = go.Figure(data=[go.Sankey(
-        node=dict(
-            pad=15,
-            thickness=20,
-            line=dict(color="black", width=0.5),
-            label=label
-        ),
-        link=dict(
-            source=source,
-            target=target,
-            value=value,
-            color=link_colors
-        )
-    )])
+    # Create DataFrame
+    centrality_data = []
+    for node in G.nodes():
+        centrality_data.append({
+            'Node': node,
+            'Out_Degree': out_degree[node],
+            'In_Degree': in_degree[node],
+            'Betweenness_Centrality': betweenness_centrality[node],
+            'Eigenvector_Centrality': eigenvector_centrality[node]
+        })
     
-    fig.update_layout(title_text="Causal Flow Diagram with Mediation Classification", font_size=10)
-    fig.write_html(os.path.join(output_dir, 'causal_flow_mediation_classified.html'))
-    fig.show()  # Display the plot
-    print(f"Alluvial diagram saved to {os.path.join(output_dir, 'causal_flow_mediation_classified.html')}")
+    centrality_df = pd.DataFrame(centrality_data)
+    
+    # Save to CSV
+    csv_path = os.path.join(output_dir, 'node_centralities.csv')
+    centrality_df.to_csv(csv_path, index=False)
+    print(f"Node centralities saved to {csv_path}")
+    
+    return centrality_df
 
-def create_causal_matrix(G, output_dir):
+def print_hub_analysis(G):
     """
-    Create a heatmap visualization of the causal strength matrix with mediation annotations
+    Print top 5 nodes for each hub type
     """
     if G.number_of_nodes() == 0:
-        print("No nodes in graph. Skipping causal matrix.")
+        print("No nodes in graph for hub analysis.")
         return
-        
-    # Get all nodes
-    nodes = list(G.nodes())
-    n = len(nodes)
     
-    # Create causal adjacency matrix
-    causal_matrix = np.zeros((n, n))
-    mediation_matrix = np.full((n, n), '', dtype=object)
+    # Calculate centrality measures
+    out_degree = dict(G.out_degree())
+    in_degree = dict(G.in_degree())
     
-    # Fill matrix with causality strengths and mediation info
-    for i, source in enumerate(nodes):
-        for j, target in enumerate(nodes):
-            if G.has_edge(source, target):
-                if 'f_stat' in G[source][target]:
-                    causal_matrix[i, j] = G[source][target]['f_stat']
-                
-                # Add mediation type annotation
-                mediation_type = G[source][target].get('mediation_type', 'direct')
-                if mediation_type == 'direct':
-                    mediation_matrix[i, j] = 'D'
-                elif mediation_type == 'partially_mediated':
-                    mediation_matrix[i, j] = 'P'
-                elif mediation_type == 'fully_mediated':
-                    mediation_matrix[i, j] = 'F'
-                else:
-                    mediation_matrix[i, j] = 'M'  # Multivariate
+    try:
+        betweenness_centrality = nx.betweenness_centrality(G)
+    except:
+        betweenness_centrality = {node: 0 for node in G.nodes()}
     
-    # Create heatmap
-    plt.figure(figsize=(14, 12))
+    try:
+        eigenvector_centrality = nx.eigenvector_centrality(G, max_iter=1000)
+    except:
+        eigenvector_centrality = nx.degree_centrality(G)
     
-    # Create annotations that combine F-stat and mediation type
-    annotations = np.full((n, n), '', dtype=object)
-    for i in range(n):
-        for j in range(n):
-            if causal_matrix[i, j] > 0:
-                annotations[i, j] = f"{causal_matrix[i, j]:.1f}\n({mediation_matrix[i, j]})"
+    print("\n" + "="*60)
+    print("HUB ANALYSIS")
+    print("="*60)
     
-    sns.heatmap(causal_matrix, annot=annotations, fmt='', cmap="YlGnBu",
-               xticklabels=nodes, yticklabels=nodes, cbar_kws={'label': 'F-statistic'})
-    plt.title('Causal Strength Matrix with Mediation Classification\n'
-              'D=Direct, P=Partially Mediated, F=Fully Mediated, M=Multivariate')
-    plt.xlabel('Effect')
-    plt.ylabel('Cause')
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'causal_matrix_mediation_classified.png'), dpi=300, bbox_inches='tight')
+    # Causal Influence Hubs (high out-degree)
+    print("\nTop 5 Causal Influence Hubs (High Out-Degree):")
+    sorted_out = sorted(out_degree.items(), key=lambda x: x[1], reverse=True)
+    for i, (node, degree) in enumerate(sorted_out[:5]):
+        if degree > 0:
+            print(f"  {i+1}. {node}: {degree} outgoing connections")
     
-    # Display the plot
-    plt.show()
-    print(f"Causal matrix saved to {os.path.join(output_dir, 'causal_matrix_mediation_classified.png')}")
+    # Vulnerability Hubs (high in-degree)
+    print("\nTop 5 Vulnerability Hubs (High In-Degree):")
+    sorted_in = sorted(in_degree.items(), key=lambda x: x[1], reverse=True)
+    for i, (node, degree) in enumerate(sorted_in[:5]):
+        if degree > 0:
+            print(f"  {i+1}. {node}: {degree} incoming connections")
+    
+    # Bridge Hubs (high betweenness centrality)
+    print("\nTop 5 Bridge Hubs (High Betweenness Centrality):")
+    sorted_betweenness = sorted(betweenness_centrality.items(), key=lambda x: x[1], reverse=True)
+    for i, (node, centrality) in enumerate(sorted_betweenness[:5]):
+        if centrality > 0:
+            print(f"  {i+1}. {node}: {centrality:.4f}")
+    
+    # Importance Hubs (high eigenvector centrality)
+    print("\nTop 5 Importance Hubs (High Eigenvector Centrality):")
+    sorted_eigenvector = sorted(eigenvector_centrality.items(), key=lambda x: x[1], reverse=True)
+    for i, (node, centrality) in enumerate(sorted_eigenvector[:5]):
+        if centrality > 0:
+            print(f"  {i+1}. {node}: {centrality:.4f}")
 
-def Decypher(data, exclude_cols=2, corr_threshold=0.6, f_stat_threshold=10, 
-                p_value_threshold=0.05, max_lag=2, output_dir=None, 
-                multivariate_groups=None, enable_mediation_analysis=True):
+def Decypher(data, exclude_cols=None, corr_threshold=0.6, f_stat_threshold=10, 
+            p_value_threshold=0.05, max_lag=2, output_dir=None):
     """
-    Enhanced Decypher function with mediation classification (NO EDGE REMOVAL)
+    Simplified Decypher function for causal network analysis
     
     Parameters:
     - data: DataFrame with time series data
-    - exclude_cols: Integer (first n columns) or list of column names to exclude
+    - exclude_cols: List of column names to exclude (in addition to auto-detected time columns)
     - corr_threshold: Minimum absolute correlation to consider for causality testing
     - f_stat_threshold: Minimum F-statistic for significance
     - p_value_threshold: Maximum p-value for significance
     - max_lag: Maximum lag to test for causality
     - output_dir: Directory to save visualizations
-    - multivariate_groups: Dictionary mapping target variables to lists of potential causal variables
-    - enable_mediation_analysis: Boolean to enable/disable mediation analysis
     
     Returns:
-    - G: NetworkX DiGraph of causal relationships (with mediation classification)
+    - G: NetworkX DiGraph of causal relationships
     - causal_df: DataFrame with all causal relationships found
-    - mediation_results: List of mediation analysis results (if enabled)
+    - centrality_df: DataFrame with node centrality measures
     """
     # Set output directory
     if output_dir is None:
@@ -644,333 +292,371 @@ def Decypher(data, exclude_cols=2, corr_threshold=0.6, f_stat_threshold=10,
     # Create output directory if it doesn't exist
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
-        
-    # Handle column exclusion
-    if isinstance(exclude_cols, int):
-        excluded_columns = data.columns[:exclude_cols]
-        data_filtered = data.drop(columns=excluded_columns)
-        print(f"Excluded first {exclude_cols} columns: {', '.join(excluded_columns)}")
-    elif isinstance(exclude_cols, list):
-        excluded_columns = exclude_cols
-        data_filtered = data.drop(columns=excluded_columns, errors='ignore')
-        print(f"Excluded columns: {', '.join(excluded_columns)}")
-    else:
-        raise ValueError("exclude_cols must be an integer or a list of column names")
     
-    # Calculate correlation matrix using the filtered dataset ONLY
-    correlation_matrix = data_filtered.corr(method='pearson')
+    # Clean data (remove time columns and NA rows)
+    data_cleaned, time_columns = clean_data(data)
     
-    # Create a mask for correlations with absolute value >= threshold
-    correlation_mask = np.abs(correlation_matrix) >= corr_threshold
+    # Handle additional column exclusions
+    if exclude_cols:
+        if isinstance(exclude_cols, str):
+            exclude_cols = [exclude_cols]
+        excluded_additional = [col for col in exclude_cols if col in data_cleaned.columns]
+        if excluded_additional:
+            data_cleaned = data_cleaned.drop(columns=excluded_additional)
+            print(f"Additionally excluded columns: {', '.join(excluded_additional)}")
     
-    # Create a filtered correlation matrix for visualization
-    filtered_corr = correlation_matrix.copy()
-    filtered_corr[~correlation_mask] = 0
+    if data_cleaned.empty or len(data_cleaned.columns) < 2:
+        print("Error: Insufficient data after cleaning. Need at least 2 columns.")
+        return None, None, None
+    
+    print(f"Analyzing {len(data_cleaned.columns)} variables: {', '.join(data_cleaned.columns)}")
+    
+    # Calculate correlation matrix
+    correlation_matrix = data_cleaned.corr(method='pearson')
     
     # Create a directed network graph
     G = nx.DiGraph()
     
-    # Add nodes ONLY from the filtered dataframe (after exclusions)
-    for column in data_filtered.columns:
+    # Add nodes
+    for column in data_cleaned.columns:
         G.add_node(column)
     
-    # Add edges based on correlation and causality
+    # Test for causal relationships
+    print("Testing causal relationships using Granger causality...")
     causal_edges = 0
-    filtered_columns = data_filtered.columns  # Make sure we only use columns from the filtered data
     
-    # Test for linear causality (Granger)
-    print("Testing linear causal relationships using Granger causality...")
-    for i, col1 in enumerate(filtered_columns):
-        for j, col2 in enumerate(filtered_columns):
-            # Don't test self-causality
-            if i != j:
+    for i, col1 in enumerate(data_cleaned.columns):
+        for j, col2 in enumerate(data_cleaned.columns):
+            if i != j:  # Don't test self-causality
                 corr_value = correlation_matrix.loc[col1, col2]
                 # Only test causality if correlation meets threshold
                 if abs(corr_value) >= corr_threshold:
                     # Check causality
-                    a_causes_b, f_ab, p_ab, lag_ab = check_granger_causality(
-                        data_filtered[col1], data_filtered[col2], 
+                    is_causal, f_stat, p_value, lag = check_granger_causality(
+                        data_cleaned[col1], data_cleaned[col2], 
                         max_lag=max_lag, 
                         f_stat_threshold=f_stat_threshold, 
                         p_value_threshold=p_value_threshold
                     )
                     
                     # Add edge if causality is detected
-                    if a_causes_b:
+                    if is_causal:
                         G.add_edge(col1, col2, 
                                   weight=abs(corr_value),
                                   correlation=corr_value,
-                                  color='red' if corr_value < 0 else 'blue',
-                                  f_stat=f_ab,
-                                  p_value=p_ab,
-                                  lag=lag_ab,
-                                  causality_type='linear',
-                                  mediation_type='direct',  # Default, will be updated if mediation analysis is run
-                                  line_style='solid',
-                                  line_width=3)
+                                  f_stat=f_stat,
+                                  p_value=p_value,
+                                  lag=lag)
                         causal_edges += 1
     
-    # Add multivariate causality if specified
-    if multivariate_groups:
-        print("Testing multivariate causal relationships...")
-        for target, predictors in multivariate_groups.items():
-            # Skip if target or any predictor isn't in the filtered data
-            if target not in data_filtered.columns:
-                continue
-                
-            valid_predictors = [p for p in predictors if p in data_filtered.columns]
-            if not valid_predictors:
-                continue
-                
-            is_causal, f_stat, p_value, lag = check_multivariate_granger_causality(
-                data_filtered, target, valid_predictors, max_lag=max_lag,
-                f_stat_threshold=f_stat_threshold, p_value_threshold=p_value_threshold
-            )
-            
-            if is_causal:
-                # Create a "meta node" representing the group
-                group_name = f"Group({','.join(valid_predictors[:2])}{'...' if len(valid_predictors) > 2 else ''})"
-                G.add_node(group_name, node_type='group', members=valid_predictors)
-                
-                # Add edge from group to target
-                G.add_edge(group_name, target,
-                          weight=1.0,  # Default weight for multivariate
-                          correlation=None,  # No single correlation value
-                          color='purple',  # Different color for multivariate
-                          f_stat=f_stat,
-                          p_value=p_value,
-                          lag=lag,
-                          causality_type='multivariate',
-                          mediation_type='multivariate',
-                          line_style='dashdot',
-                          line_width=4)
-                causal_edges += 1
+    print(f"Found {causal_edges} causal relationships")
     
-    print(f"\nInitial network created with {G.number_of_nodes()} nodes and {causal_edges} causal edges")
-    
-    # Mediation analysis - CLASSIFY EDGES, DON'T REMOVE THEM
-    mediation_results = []
-    if enable_mediation_analysis and G.number_of_edges() > 2:
-        print(f"\nPerforming mediation analysis (classification only)...")
-        G, mediation_results = analyze_mediation_relationships(G, data_filtered, max_lag=max_lag)
-        print(f"Network after mediation classification: {G.number_of_nodes()} nodes and {G.number_of_edges()} edges")
-    else:
-        print("Mediation analysis skipped (disabled or insufficient edges)")
-    
-    # After adding all edges, remove nodes without any connections
-    nodes_to_remove = []
-    for node in G.nodes():
-        if G.degree(node) == 0:  # Node has no incoming or outgoing edges
-            nodes_to_remove.append(node)
-    
+    # Remove nodes without connections
+    nodes_to_remove = [node for node in G.nodes() if G.degree(node) == 0]
     G.remove_nodes_from(nodes_to_remove)
+    
     if nodes_to_remove:
-        print(f"\nRemoved {len(nodes_to_remove)} nodes without connections")
-        if len(nodes_to_remove) <= 10:  # Only print names if there aren't too many
-            print(f"Removed nodes: {', '.join(nodes_to_remove)}")
-        else:
-            print(f"Removed nodes: {', '.join(nodes_to_remove[:5])}... and {len(nodes_to_remove)-5} more")
+        print(f"Removed {len(nodes_to_remove)} nodes without causal connections")
     
-    # Visualize the correlation heatmap
-    plt.figure(figsize=(12, 10))
-    mask = np.triu(np.ones_like(correlation_matrix, dtype=bool))
-    cmap = sns.diverging_palette(230, 20, as_cmap=True)
-    sns.heatmap(correlation_matrix, mask=mask, cmap=cmap, vmax=1, vmin=-1, center=0,
-                square=True, linewidths=.5, cbar_kws={"shrink": .5})
-    plt.title('Correlation Matrix Heatmap')
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'correlation_heatmap.png'))
-    plt.show()
-    
-    # Create enhanced visualizations
+    # Create visualizations and analysis
     if G.number_of_nodes() > 0:
-        # Enhanced network visualization with mediation classification
-        visualize_enhanced_network(G, output_dir, mediation_results)
+        # Network visualization
+        visualize_network(G, output_dir)
         
-        # Mediation summary visualization
-        if mediation_results:
-            create_mediation_summary(mediation_results, output_dir)
+        # Create centrality CSV
+        centrality_df = create_centrality_csv(G, output_dir)
         
-        # Alluvial diagram
-        create_alluvial_diagram(G, output_dir)
+        # Print hub analysis
+        print_hub_analysis(G)
         
-        # Causal matrix
-        create_causal_matrix(G, output_dir)
-    else:
-        print("No causal relationships found meeting the criteria. Visualizations skipped.")
-    
-    # Calculate network metrics
-    print("\nFinal Network Summary:")
-    print(f"Number of nodes: {G.number_of_nodes()}")
-    print(f"Number of edges: {G.number_of_edges()}")
-    
-    # Count edges by mediation type
-    direct_count = 0
-    partial_count = 0
-    full_count = 0
-    multivar_count = 0
-    
-    for u, v, data in G.edges(data=True):
-        mediation_type = data.get('mediation_type', 'direct')
-        if mediation_type == 'direct':
-            direct_count += 1
-        elif mediation_type == 'partially_mediated':
-            partial_count += 1
-        elif mediation_type == 'fully_mediated':
-            full_count += 1
-        elif mediation_type == 'multivariate':
-            multivar_count += 1
-    
-    print(f"\nEdge Classification:")
-    print(f"  Direct effects: {direct_count}")
-    print(f"  Partially mediated: {partial_count}")
-    print(f"  Fully mediated: {full_count}")
-    print(f"  Multivariate: {multivar_count}")
-    
-    # Calculate and print node centrality measures
-    if G.number_of_nodes() > 0 and G.number_of_edges() > 0:
-        # Out-degree (causal influence)
-        print("\nTop 5 nodes by out-degree (causal influence):")
-        out_degree_dict = dict(G.out_degree())
-        sorted_out_degree = sorted(out_degree_dict.items(), key=lambda x: x[1], reverse=True)
-        for node, degree in sorted_out_degree[:min(5, len(sorted_out_degree))]:
-            if degree > 0:  # Only show nodes with outgoing connections
-                print(f"  {node}: {degree} outgoing connections")
-        
-        # In-degree (influenced by others)
-        print("\nTop 5 nodes by in-degree (influenced by others):")
-        in_degree_dict = dict(G.in_degree())
-        sorted_in_degree = sorted(in_degree_dict.items(), key=lambda x: x[1], reverse=True)
-        for node, degree in sorted_in_degree[:min(5, len(sorted_in_degree))]:
-            if degree > 0:  # Only show nodes with incoming connections
-                print(f"  {node}: {degree} incoming connections")
-        
-        # Degree centrality (overall connection importance)
-        print("\nTop 5 nodes by degree centrality (overall connection importance):")
-        degree_centrality = nx.degree_centrality(G)
-        sorted_degree = sorted(degree_centrality.items(), key=lambda x: x[1], reverse=True)
-        for node, centrality in sorted_degree[:min(5, len(sorted_degree))]:
-            print(f"  {node}: {centrality:.4f}")
-        
-        # Betweenness centrality (information flow brokers)
-        print("\nTop 5 nodes by betweenness centrality (information flow brokers):")
-        betweenness_centrality = nx.betweenness_centrality(G)
-        sorted_betweenness = sorted(betweenness_centrality.items(), key=lambda x: x[1], reverse=True)
-        for node, centrality in sorted_betweenness[:min(5, len(sorted_betweenness))]:
-            print(f"  {node}: {centrality:.4f}")
-        
-        # Show relationships by mediation type
-        print("\nCausal Relationships by Type:")
-        
-        # Direct relationships
-        direct_edges = [(u, v, data) for u, v, data in G.edges(data=True) 
-                        if data.get('mediation_type') == 'direct' and data.get('causality_type') == 'linear']
-        if direct_edges:
-            print(f"\nDirect Effects ({len(direct_edges)}):")
-            sorted_direct = sorted(direct_edges, key=lambda x: x[2]['f_stat'], reverse=True)
-            for u, v, data in sorted_direct[:min(5, len(sorted_direct))]:
-                print(f"  {u} → {v}: F={data['f_stat']:.2f}, p={data['p_value']:.5f}, corr={data.get('correlation', 'N/A'):.3f}")
-        
-        # Partially mediated relationships
-        partial_edges = [(u, v, data) for u, v, data in G.edges(data=True) 
-                        if data.get('mediation_type') == 'partially_mediated']
-        if partial_edges:
-            print(f"\nPartially Mediated Effects ({len(partial_edges)}):")
-            sorted_partial = sorted(partial_edges, key=lambda x: x[2]['f_stat'], reverse=True)
-            for u, v, data in sorted_partial[:min(5, len(sorted_partial))]:
-                mediator = data.get('best_mediator', 'Unknown')
-                ratio = data.get('mediation_ratio', 0)
-                print(f"  {u} → {v} (via {mediator}): F={data['f_stat']:.2f}, mediation={ratio:.2f}")
-        
-        # Fully mediated relationships
-        full_edges = [(u, v, data) for u, v, data in G.edges(data=True) 
-                     if data.get('mediation_type') == 'fully_mediated']
-        if full_edges:
-            print(f"\nFully Mediated Effects ({len(full_edges)}):")
-            sorted_full = sorted(full_edges, key=lambda x: x[2]['f_stat'], reverse=True)
-            for u, v, data in sorted_full[:min(5, len(sorted_full))]:
-                mediator = data.get('best_mediator', 'Unknown')
-                ratio = data.get('mediation_ratio', 0)
-                print(f"  {u} → {v} (via {mediator}): F={data['f_stat']:.2f}, mediation={ratio:.2f}")
-        
-        # Multivariate relationships
-        multivar_edges = [(u, v, data) for u, v, data in G.edges(data=True) 
-                         if data.get('causality_type') == 'multivariate']
-        if multivar_edges:
-            print(f"\nMultivariate Effects ({len(multivar_edges)}):")
-            for u, v, data in multivar_edges[:min(5, len(multivar_edges))]:
-                print(f"  {u} → {v}: F={data['f_stat']:.2f}, p={data['p_value']:.5f}, lag={data['lag']}")
-    
-    # Generate a table of all causal relationships
-    causal_df = None
-    if G.number_of_edges() > 0:
+        # Create causal relationships DataFrame
         causal_relationships = []
         for u, v, data in G.edges(data=True):
-            causality_type = data.get('causality_type', 'unknown')
-            mediation_type = data.get('mediation_type', 'direct')
-            
-            # Build row based on relationship type
-            if causality_type == 'linear':
-                mediation_ratio = data.get('mediation_ratio', 0.0)
-                best_mediator = data.get('best_mediator', 'None')
-                causal_relationships.append((
-                    u,  # Cause
-                    v,  # Effect
-                    data.get('correlation', None),  # Correlation value
-                    "Positive" if data.get('correlation', 0) > 0 else "Negative",  # Correlation type
-                    data.get('f_stat', None),  # F-statistic
-                    data.get('p_value', None),  # p-value
-                    data.get('lag', None),     # Optimal lag
-                    "Linear",                  # Causality type
-                    mediation_type.replace('_', ' ').title(),  # Mediation type (formatted)
-                    mediation_ratio,           # Mediation ratio
-                    best_mediator))            # Best mediator
-            elif causality_type == 'multivariate':
-                causal_relationships.append((
-                    u,  # Cause (group)
-                    v,  # Effect
-                    None,                      # No single correlation
-                    "Group",                   # Correlation type
-                    data.get('f_stat', None),  # F-statistic
-                    data.get('p_value', None), # p-value
-                    data.get('lag', None),     # Optimal lag
-                    "Multivariate",            # Causality type
-                    "Multivariate",            # Mediation type
-                    0.0,                       # No mediation ratio for groups
-                    "N/A"))                    # No mediator for groups
+            causal_relationships.append({
+                'Cause': u,
+                'Effect': v,
+                'Correlation': data['correlation'],
+                'F_Statistic': data['f_stat'],
+                'P_Value': data['p_value'],
+                'Optimal_Lag': data['lag']
+            })
         
-        # Convert to DataFrame and sort by causality strength
-        causal_df = pd.DataFrame(causal_relationships, 
-                                 columns=["Cause", "Effect", "Correlation", "Correlation Type", 
-                                         "F-statistic", "p-value", "Optimal Lag", "Causality Type",
-                                         "Mediation Type", "Mediation Ratio", "Best Mediator"])
+        causal_df = pd.DataFrame(causal_relationships)
+        causal_df = causal_df.sort_values('F_Statistic', ascending=False)
         
-        # Sort by strength (F-stat)
-        causal_df = causal_df.sort_values(by="F-statistic", ascending=False)
+        # Save causal relationships
+        causal_path = os.path.join(output_dir, 'causal_relationships.csv')
+        causal_df.to_csv(causal_path, index=False)
+        print(f"Causal relationships saved to {causal_path}")
         
-        # Print the DataFrame
-        print("\nFinal causal relationships (with mediation classification):")
-        print(causal_df.to_string(index=False))
+        # Print network summary
+        print(f"\nNetwork Summary:")
+        print(f"Nodes: {G.number_of_nodes()}")
+        print(f"Edges: {G.number_of_edges()}")
         
-        # Save to CSV
-        causal_df.to_csv(os.path.join(output_dir, 'causal_relationships_classified.csv'), index=False)
-        print(f"\nCausal relationships saved to {os.path.join(output_dir, 'causal_relationships_classified.csv')}")
-        
-    return G, causal_df, mediation_results
+    else:
+        print("No causal relationships found meeting the criteria.")
+        causal_df = pd.DataFrame()
+        centrality_df = pd.DataFrame()
+    
+    return G, causal_df, centrality_df
 
-def simple_causal_query(target_variable, causal_graph, top_n=3):
-    """Simple version: just find strongest causal influences"""
+def query_causal_influences(target_variable, causal_graph, top_n=5):
+    """
+    Find the top N factors that causally influence a target variable
+    
+    Parameters:
+    - target_variable: Name of the target variable
+    - causal_graph: NetworkX DiGraph from Decypher analysis
+    - top_n: Number of top influences to return
+    
+    Returns:
+    - List of tuples: (cause, f_statistic)
+    """
+    if causal_graph is None or causal_graph.number_of_edges() == 0:
+        print("No causal graph available. Run Decypher analysis first.")
+        return []
+    
     influences = []
     
+    # Find all edges pointing to the target variable
     for cause, effect, data in causal_graph.edges(data=True):
         if effect.lower() == target_variable.lower():
             influences.append((cause, data.get('f_stat', 0)))
     
+    if not influences:
+        print(f"No causal influences found for '{target_variable}'")
+        print(f"Available variables: {list(causal_graph.nodes())}")
+        return []
+    
+    # Sort by F-statistic strength
     influences.sort(key=lambda x: x[1], reverse=True)
     
-    print(f"Top {top_n} factors influencing {target_variable}:")
-    for cause, strength in influences[:top_n]:
-        print(f"- {cause}: F-statistic = {strength:.2f}")
+    print(f"\nTop {min(top_n, len(influences))} factors causally influencing '{target_variable}':")
+    print("-" * 50)
+    for i, (cause, f_stat) in enumerate(influences[:top_n]):
+        print(f"{i+1:2d}. {cause:<25} F-statistic: {f_stat:.2f}")
+    
+    return influences[:top_n]
 
-# Usage
-simple_causal_query("SmO2", G, top_n=5)
+def plot_bollinger_bands(data, metric_name, time_column=None, window=20, std_dev=1.5, output_dir='.'):
+    """
+    Plot Bollinger Bands for a specific metric
+    
+    Parameters:
+    - data: Original DataFrame (before cleaning)
+    - metric_name: Name of the metric to plot
+    - time_column: Name of time column (auto-detected if None)
+    - window: Rolling window for moving average (default: 20)
+    - std_dev: Standard deviations for bands (default: 1.5)
+    - output_dir: Directory to save plot
+    """
+    # Auto-detect time column if not specified
+    if time_column is None:
+        time_columns = detect_time_columns(data)
+        if time_columns:
+            time_column = time_columns[0]
+        else:
+            print("No time column found. Cannot create Bollinger Bands.")
+            return
+    
+    # Check if metric exists
+    if metric_name not in data.columns:
+        print(f"Metric '{metric_name}' not found in data.")
+        print(f"Available metrics: {list(data.columns)}")
+        return
+    
+    # Prepare data
+    df = data[[time_column, metric_name]].copy().dropna()
+    
+    # Convert time column to datetime if needed
+    if not pd.api.types.is_datetime64_any_dtype(df[time_column]):
+        try:
+            df[time_column] = pd.to_datetime(df[time_column])
+        except:
+            print(f"Could not convert {time_column} to datetime format")
+            return
+    
+    # Sort by time
+    df = df.sort_values(time_column)
+    
+    # Calculate Bollinger Bands
+    df['Moving_Average'] = df[metric_name].rolling(window=window).mean()
+    df['Upper_Band'] = df['Moving_Average'] + (df[metric_name].rolling(window=window).std() * std_dev)
+    df['Lower_Band'] = df['Moving_Average'] - (df[metric_name].rolling(window=window).std() * std_dev)
+    
+    # Create plot
+    plt.figure(figsize=(14, 8))
+    
+    # Plot the metric
+    plt.plot(df[time_column], df[metric_name], label=metric_name, color='green', linewidth=1.5)
+    
+    # Plot moving average
+    plt.plot(df[time_column], df['Moving_Average'], label='Moving Average', color='blue', linewidth=2)
+    
+    # Plot Bollinger Bands
+    plt.plot(df[time_column], df['Upper_Band'], label='Upper Band', color='red', linestyle='--', alpha=0.7)
+    plt.plot(df[time_column], df['Lower_Band'], label='Lower Band', color='red', linestyle='--', alpha=0.7)
+    
+    # Fill between bands
+    plt.fill_between(df[time_column], df['Lower_Band'], df['Upper_Band'], alpha=0.1, color='gray')
+    
+    plt.title(f'Bollinger Bands for {metric_name}\n({window}-period moving average, {std_dev} std dev)')
+    plt.xlabel('Time')
+    plt.ylabel(metric_name)
+    plt.legend()
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    
+    # Save plot
+    plot_path = os.path.join(output_dir, f'{metric_name}_bollinger_bands.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.show()
+    print(f"Bollinger Bands plot saved to {plot_path}")
+
+def forecast_metric(data, metric_name, forecast_days=7, history_days=30, time_column=None, output_dir='.'):
+    """
+    Forecast future values for a metric using ARIMA
+    
+    Parameters:
+    - data: Original DataFrame (before cleaning)
+    - metric_name: Name of the metric to forecast
+    - forecast_days: Number of days to forecast into the future
+    - history_days: Number of recent days to use for training
+    - time_column: Name of time column (auto-detected if None)
+    - output_dir: Directory to save plot
+    
+    Returns:
+    - forecast_df: DataFrame with forecasted values
+    """
+    # Auto-detect time column if not specified
+    if time_column is None:
+        time_columns = detect_time_columns(data)
+        if time_columns:
+            time_column = time_columns[0]
+        else:
+            print("No time column found. Cannot create forecast.")
+            return None
+    
+    # Check if metric exists
+    if metric_name not in data.columns:
+        print(f"Metric '{metric_name}' not found in data.")
+        print(f"Available metrics: {list(data.columns)}")
+        return None
+    
+    # Prepare data
+    df = data[[time_column, metric_name]].copy().dropna()
+    
+    # Convert time column to datetime if needed
+    if not pd.api.types.is_datetime64_any_dtype(df[time_column]):
+        try:
+            df[time_column] = pd.to_datetime(df[time_column])
+        except:
+            print(f"Could not convert {time_column} to datetime format")
+            return None
+    
+    # Sort by time and get recent data
+    df = df.sort_values(time_column)
+    recent_data = df.tail(history_days)
+    
+    if len(recent_data) < 10:
+        print(f"Insufficient data for forecasting. Need at least 10 points, got {len(recent_data)}")
+        return None
+    
+    # Fit ARIMA model
+    try:
+        # Try different ARIMA parameters and select best one
+        best_aic = float('inf')
+        best_model = None
+        
+        for p in range(3):
+            for d in range(2):
+                for q in range(3):
+                    try:
+                        model = ARIMA(recent_data[metric_name], order=(p, d, q))
+                        fitted_model = model.fit()
+                        if fitted_model.aic < best_aic:
+                            best_aic = fitted_model.aic
+                            best_model = fitted_model
+                    except:
+                        continue
+        
+        if best_model is None:
+            print("Could not fit ARIMA model. Using simple linear trend instead.")
+            # Fallback to simple linear regression
+            x = np.arange(len(recent_data))
+            y = recent_data[metric_name].values
+            coeffs = np.polyfit(x, y, 1)
+            
+            # Generate future dates
+            last_date = recent_data[time_column].iloc[-1]
+            future_dates = pd.date_range(start=last_date + pd.Timedelta(days=1), 
+                                       periods=forecast_days, freq='D')
+            
+            # Simple linear forecast
+            future_x = np.arange(len(recent_data), len(recent_data) + forecast_days)
+            forecast_values = np.polyval(coeffs, future_x)
+            
+            forecast_df = pd.DataFrame({
+                'Date': future_dates,
+                'Forecast': forecast_values,
+                'Lower_CI': forecast_values - np.std(y),
+                'Upper_CI': forecast_values + np.std(y)
+            })
+        else:
+            # Use ARIMA forecast
+            forecast = best_model.forecast(steps=forecast_days)
+            forecast_ci = best_model.get_forecast(steps=forecast_days).conf_int()
+            
+            # Generate future dates
+            last_date = recent_data[time_column].iloc[-1]
+            future_dates = pd.date_range(start=last_date + pd.Timedelta(days=1), 
+                                       periods=forecast_days, freq='D')
+            
+            forecast_df = pd.DataFrame({
+                'Date': future_dates,
+                'Forecast': forecast,
+                'Lower_CI': forecast_ci.iloc[:, 0],
+                'Upper_CI': forecast_ci.iloc[:, 1]
+            })
+    
+    except Exception as e:
+        print(f"Error in forecasting: {e}")
+        return None
+    
+    # Create forecast plot
+    plt.figure(figsize=(14, 8))
+    
+    # Plot historical data
+    plt.plot(recent_data[time_column], recent_data[metric_name], 
+             label='Historical Data', color='blue', linewidth=2)
+    
+    # Plot forecast
+    plt.plot(forecast_df['Date'], forecast_df['Forecast'], 
+             label='Forecast', color='red', linewidth=2, linestyle='--')
+    
+    # Plot confidence interval
+    plt.fill_between(forecast_df['Date'], 
+                     forecast_df['Lower_CI'], 
+                     forecast_df['Upper_CI'], 
+                     alpha=0.3, color='red', label='Confidence Interval')
+    
+    plt.title(f'{forecast_days}-Day Forecast for {metric_name}\n(Based on last {history_days} days)')
+    plt.xlabel('Date')
+    plt.ylabel(metric_name)
+    plt.legend()
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    
+    # Save plot
+    plot_path = os.path.join(output_dir, f'{metric_name}_forecast.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.show()
+    print(f"Forecast plot saved to {plot_path}")
+    
+    # Save forecast data
+    forecast_path = os.path.join(output_dir, f'{metric_name}_forecast.csv')
+    forecast_df.to_csv(forecast_path, index=False)
+    print(f"Forecast data saved to {forecast_path}")
+    
+    return forecast_df
